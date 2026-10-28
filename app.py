@@ -94,7 +94,7 @@ def build_rows(schedule, year, month, hours, times, employee_overrides, meal_hou
                 start,end=sample_shift(d,section,hours,start_hour,22)
                 duration=max(0,(end-start).total_seconds()/3600-meal_hours)
             else:start=end=None;duration=0
-            rows.append({'section':section,'employee':employee,'date':d,'marker':original,'is_work':work,'start':start,'end':end,'hours':duration,'meal':meal_hours if work else 0,'leave':leave_type or '', 'status':('Concediu: '+leave_type) if leave_type else ('Simulare pe baza marcajului x' if work else ('Marcaj neinterpretat' if original and textnorm(original) not in ('off','liber','l') else 'Fara prezenta simulata'))})
+            rows.append({'section':section,'employee':employee,'date':d,'marker':original,'is_work':work,'start':start,'end':end,'hours':duration,'meal':meal_hours if work else 0,'leave':leave_type or '', 'status':('Concediu introdus manual: '+leave_type) if leave_type else ('Simulare pe baza marcajului x' if work else ('Marcaj neinterpretat (NU concediu)' if original and textnorm(original) not in ('off','liber','l') else 'Zi nelucrata (NU concediu)'))})
     return rows
 
 def assess(rows, min_rest, weekly_limit):
@@ -239,7 +239,7 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
         ['PERIOADA',f'{month:02d}/{year}'],
         ['PAUZA MASA','Scazuta din durata de prezenta; configurata in aplicatie'],
         ['DATE CONTRACTUALE','Normele individuale sunt preluate din profilurile configurate si necesita confirmare CIM'],
-        ['CONCEDII','Marcaje adaugate doar in scenariu, nu documente justificative'],
+        ['CONCEDII','Doar perioadele introduse explicit in aplicatie; zilele nelucrate nu sunt concedii'],
         ['ATENTIE','Datele din acest fisier nu pot inlocui evidenta orelor efectiv lucrate']
     ]:audit.append(line)
     stream=BytesIO();wb.save(stream);return stream.getvalue()
@@ -286,10 +286,10 @@ def save_profiles(records):
     db_request('POST', '?on_conflict=tenant_id,employee_key', records,
                {'Prefer': 'resolution=merge-duplicates,return=minimal'})
 
-DEFAULT_PROFILE = {'contract_type': 'Part-time', 'hours_per_day': 4.0,
-                   'hours_per_week': 20.0, 'distribution': 'Inegala',
+DEFAULT_PROFILE = {'contract_type': 'Full-time', 'hours_per_day': 8.0,
+                   'hours_per_week': 40.0, 'distribution': 'Uniforma',
                    'meal_minutes': 60, 'shift_start': '10:00',
-                   'shift_presence_hours': 5.0}
+                   'shift_presence_hours': 9.0}
 
 def check_individual(rows, profiles):
     alerts = []
@@ -325,7 +325,7 @@ labels={f'{calendar.month_name[m]} {y}':(y,m) for y,m in periods}
 selected=st.selectbox('2. Luna simulata',list(labels.keys()))
 year,month=labels[selected]
 st.subheader('3. Profiluri contractuale individuale')
-st.caption('Implicit, angajatii noi sunt Part-time, 4 ore/zi, repartizare inegala, pauza de masa 60 minute. Verifica datele fiecarui CIM inainte de salvare.')
+st.caption('Implicit pentru un angajat fara profil salvat: Full-time, 8 ore/zi, 40 ore/saptamana, repartizare uniforma, pauza de masa 60 minute, prezenta 9 ore. Zilele nelucrate NU sunt concediu.')
 people_current=sorted({(k[2],k[3]) for k in schedule if k[:2]==(year,month)})
 if get_db_config() is None:
     st.error('Persistenta nu este configurata. Adauga SUPABASE_URL si SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets. Poti testa profilurile doar in aceasta sesiune, dar ele NU vor fi salvate definitiv.')
@@ -380,7 +380,7 @@ if st.button('Salveaza permanent profilurile angajatilor',type='primary',disable
         save_profiles(payload)
         st.success(f'{len(payload)} profiluri salvate in baza de date cloud.')
     except Exception as exc:st.error('Salvarea a esuat: '+str(exc))
-st.info('Modificarile din tabel sunt folosite imediat in simulare. Pentru persistenta trebuie apasat butonul de salvare. Un profil nou se initializeaza cu valorile implicite, pana la confirmarea contractului.')
+st.info('Profilurile deja salvate in Supabase raman neschimbate (inclusiv cele part-time din v3). Valorile Full-time 8h se aplica numai angajatilor fara profil salvat. Pentru a schimba un profil existent, actualizeaza randul si apasa Salveaza permanent profilurile angajatilor.')
 st.subheader('4. Reguli de verificare orientative')
 c1,c2=st.columns(2)
 min_rest=c1.number_input('Repaus intre ture (ore)',min_value=8,max_value=24,value=12)
@@ -393,6 +393,7 @@ with st.expander('Concedii - doar in sesiune (nesalvate in baza de date)',expand
     lcol1,lcol2=st.columns(2)
     first=lcol1.date_input('De la',value=date(year,month,1),min_value=date(year,month,1),max_value=date(year,month,calendar.monthrange(year,month)[1]))
     last=lcol2.date_input('Pana la',value=date(year,month,1),min_value=date(year,month,1),max_value=date(year,month,calendar.monthrange(year,month)[1]))
+    st.caption('Numai zilele introduse explicit aici sunt marcate CO / CM / CFS. O zi libera / OFF / goala nu devine concediu automat. Intervalul selectat se aplica explicit tuturor datelor calendaristice selectate; verifica zilele de repaus inainte de adaugare.')
     if st.button('Adauga concediul'):
         if last<first:st.error('Data finala este inaintea datei initiale.')
         else:st.session_state.leave_items.append((year,month,person_choice,first,last,leave_type))
@@ -419,8 +420,10 @@ c1,c2,c3=st.columns(3)
 c1.metric('Angajati detectati',len(set((r['section'],r['employee']) for r in rows)))
 c2.metric('Zile marcate ca lucrate',sum(r['is_work'] for r in rows))
 c3.metric('Semnalari orientative',len(issues))
-st.subheader('Previzualizare simulare')
-st.dataframe([{'Sectie':r['section'],'Angajat':r['employee'],'Data':str(r['date']),'Original':r['marker'],'Intrare simulata':r['start'].strftime('%d.%m %H:%M') if r['start'] else '', 'Iesire simulata':r['end'].strftime('%d.%m %H:%M') if r['end'] else '', 'Ore efective simulate':r['hours'],'Pauza masa':r['meal'],'Concediu':r['leave']} for r in rows if r['is_work']],use_container_width=True,hide_index=True)
+st.subheader('Previzualizare simulare (inclusiv zile libere si concedii manuale)')
+st.caption('CONCEDIU = numai daca a fost introdus manual. ZILE NELUCRATE = marcaj gol, OFF sau liber fara cerere de concediu.')
+st.dataframe([{'Sectie':r['section'],'Angajat':r['employee'],'Data':str(r['date']),'Original':r['marker'],'Status':('Concediu introdus manual' if r['leave'] else ('Zi lucrata' if r['is_work'] else 'Zi nelucrata')), 'Intrare simulata':r['start'].strftime('%d.%m %H:%M') if r['start'] else '', 'Iesire simulata':r['end'].strftime('%d.%m %H:%M') if r['end'] else '', 'Ore efective simulate':r['hours'],'Pauza masa':r['meal'],'Concediu':r['leave']} for r in rows],use_container_width=True,hide_index=True)
+st.caption(f'Zile de concediu introduse manual: {sum(bool(r["leave"]) for r in rows)} | Zile nelucrate fara concediu: {sum(not r["is_work"] and not r["leave"] for r in rows)}')
 if issues:
     with st.expander('Semnalari / abateri de verificat'):
         st.dataframe([{'Sectie':i[0],'Angajat':i[1],'Perioada':i[2],'Regula':i[3],'Detalii':i[4]} for i in issues],use_container_width=True,hide_index=True)
