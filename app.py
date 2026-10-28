@@ -126,7 +126,7 @@ def assess(rows, min_rest, weekly_limit):
                 break
     return issues
 
-def make_export(rows,issues, source_name, year,month, assumptions,diagnostics):
+def make_export(rows,issues, source_name, year,month, assumptions,diagnostics,profiles):
     wb=Workbook(); sim=wb.active;sim.title='SIMULARE - NU PONTAJ'
     sim.append(['SECTIE','ANGAJAT','DATA','ZI','MARCAJ SURSA','INTRARE SIMULATA','IESIRE SIMULATA','ORE SIMULATE','PAUZA MASA (h)','CONCEDIU','EXPLICATIE'])
     for r in rows:
@@ -155,9 +155,14 @@ def make_export(rows,issues, source_name, year,month, assumptions,diagnostics):
             letter=col[0].column_letter
             width=min(68,max(14,max(len(str(c.value or '')) for c in list(col)[:250])+2))
             ws.column_dimensions[letter].width=width
+    prof=wb.create_sheet('PROFILURI CONTRACTUALE')
+    prof.append(['SECTIE','ANGAJAT','CONTRACT','ORE/ZI REFERINTA','ORE/SAPT','REPARTIZARE','PAUZA MIN','START','PREZENTA ORE'])
+    for (sec,name) in sorted({(r['section'],r['employee']) for r in rows}):
+        p=profiles[profile_key(sec,name)]
+        prof.append([sec,name,p['contract_type'],p['hours_per_day'],p['hours_per_week'],p['distribution'],p['meal_minutes'],p['shift_start'],p['shift_presence_hours']])
     stream=BytesIO();wb.save(stream);return stream.getvalue()
 
-def make_cfp_export(rows, template_bytes, year, month):
+def make_cfp_export(rows, template_bytes, year, month, profiles):
     """Copy the actual CFP template unchanged in layout; fill only simulated roster and time cells.
     If roster exceeds available blocks, use additional copies of the same template as new sheets.
     """
@@ -207,7 +212,7 @@ def make_cfp_export(rows, template_bytes, year, month):
             write_editable(tab,base,2,name,required=True)
             clear_editable(tab,base,3)  # do not inherit another employee's hire date
             write_editable(tab,base,4,sec)
-            write_editable(tab,base,5,8)  # assumption only, not verified contracted norm
+            write_editable(tab,base,5,profiles[profile_key(sec,name)]['hours_per_day'])  # norma de referinta din profil, confirmare CIM necesara
             for day in range(1,32):
                 c=6+2*(day-1)
                 r=by_person[(sec,name)].get(day)
@@ -233,11 +238,79 @@ def make_cfp_export(rows, template_bytes, year, month):
         ['TIP','SIMULARE - NU PONTAJ REAL'],
         ['PERIOADA',f'{month:02d}/{year}'],
         ['PAUZA MASA','Scazuta din durata de prezenta; configurata in aplicatie'],
-        ['DATE CONTRACTUALE','Norma din sablon este o ipoteza (8 ore); validati individual'],
+        ['DATE CONTRACTUALE','Normele individuale sunt preluate din profilurile configurate si necesita confirmare CIM'],
         ['CONCEDII','Marcaje adaugate doar in scenariu, nu documente justificative'],
         ['ATENTIE','Datele din acest fisier nu pot inlocui evidenta orelor efectiv lucrate']
     ]:audit.append(line)
     stream=BytesIO();wb.save(stream);return stream.getvalue()
+
+
+# Persistenta cloud: Supabase PostgREST; cheia privata se pastreaza numai in Streamlit Secrets.
+import requests
+
+def profile_key(section, name):
+    return textnorm(section) + '::' + textnorm(name)
+
+def get_db_config():
+    try:
+        url = str(st.secrets.get('SUPABASE_URL', '')).rstrip('/')
+        key = str(st.secrets.get('SUPABASE_SERVICE_ROLE_KEY', ''))
+        tenant = str(st.secrets.get('PONTAJ_TENANT', 'restaurant-default'))
+        return (url, key, tenant) if url and key else None
+    except Exception:
+        return None
+
+def db_request(method, suffix, payload=None, extra_headers=None):
+    cfg = get_db_config()
+    if cfg is None:
+        raise RuntimeError('Lipseste configurarea Supabase in Streamlit Secrets.')
+    url, key, tenant = cfg
+    headers = {'apikey': key, 'Authorization': 'Bearer ' + key,
+               'Content-Type': 'application/json', 'Accept': 'application/json'}
+    if extra_headers: headers.update(extra_headers)
+    response = requests.request(method, url + '/rest/v1/employee_profiles' + suffix,
+                                json=payload, headers=headers, timeout=20)
+    response.raise_for_status()
+    return response.json() if response.content else []
+
+def load_profiles():
+    if get_db_config() is None:
+        return {}
+    tenant = get_db_config()[2]
+    from urllib.parse import quote
+    records = db_request('GET', '?tenant_id=eq.' + quote(tenant, safe='') + '&select=*')
+    return {r['employee_key']: r for r in records}
+
+def save_profiles(records):
+    if not records:return
+    db_request('POST', '?on_conflict=tenant_id,employee_key', records,
+               {'Prefer': 'resolution=merge-duplicates,return=minimal'})
+
+DEFAULT_PROFILE = {'contract_type': 'Part-time', 'hours_per_day': 4.0,
+                   'hours_per_week': 20.0, 'distribution': 'Inegala',
+                   'meal_minutes': 60, 'shift_start': '10:00',
+                   'shift_presence_hours': 5.0}
+
+def check_individual(rows, profiles):
+    alerts = []
+    people = defaultdict(list)
+    for r in rows: people[(r['section'],r['employee'])].append(r)
+    for ident, items in people.items():
+        p = profiles[profile_key(*ident)]
+        weekly = defaultdict(float)
+        for r in items:
+            if not r['is_work']:continue
+            h = float(r['hours'])
+            weekly[r['date'].isocalendar()[:2]] += h
+            if p['contract_type']=='Part-time' and h > float(p['hours_per_day']) + 0.01:
+                alerts.append([*ident, str(r['date']), 'Part-time: depasire norma zilnica de referinta',
+                               f'{h:g}h fata de {p["hours_per_day"]}h. Pentru repartizare inegala verificati CIM si programul agreat; aceasta nu este automat o incalcare.'])
+        for (year,week),hours in weekly.items():
+            contracted=float(p['hours_per_week'])
+            if hours > contracted + 0.01:
+                alerts.append([*ident, f'Saptamana {week}/{year}', 'Depasire norma contractuala',
+                               f'{hours:g}h simulate vs {contracted:g}h contractate; verificati regimul legal si CIM.'])
+    return alerts
 
 uploaded=st.file_uploader('1. Incarca fisierul de program (Kitchen Staff)',type=['xlsx'])
 if uploaded is None:
@@ -251,25 +324,69 @@ if not periods:st.error('Nu au fost detectate luni cu marcaje de prezenta.');st.
 labels={f'{calendar.month_name[m]} {y}':(y,m) for y,m in periods}
 selected=st.selectbox('2. Luna simulata',list(labels.keys()))
 year,month=labels[selected]
-st.subheader('3. Ipoteze pentru scenariul de ture')
-st.caption('Acestea sunt ore presupuse, nu ore constatate. Poti modifica orele pe sectie si pe angajat.')
-cols=st.columns(3)
-shift_hours=cols[0].number_input('Durata prezentei simulate (ore, include pauza)',min_value=1.5,max_value=16.0,value=9.0,step=0.5)
-min_rest=cols[1].number_input('Prag orientativ repaus intre ture (ore)',min_value=1,max_value=24,value=12)
-weekly_limit=cols[2].number_input('Prag orientativ ore/saptamana',min_value=8,max_value=80,value=48)
-meal_hours=st.selectbox('Pauza de masa scazuta din prezenta', [1.0,0.5,0.0], index=0, format_func=lambda v:f'{v:g} ore')
-sections=sorted({k[2] for k in schedule if k[:2]==(year,month)})
-times={}
-for section in sections:
-    times[section]=st.select_slider(f'Ora inceperii turei simulate – {section}',options=[x/2 for x in range(48)],value=10.0,format_func=lambda v:f'{int(v):02d}:{int((v%1)*60):02d}',key='start_'+section)
-with st.expander('Ore de inceput personalizate pe angajat (optional)'):
-    override={}
-    persons=sorted({(k[2],k[3]) for k in schedule if k[:2]==(year,month)})
-    for sec,name in persons:
-        entry=st.select_slider(f'{sec} / {name}',options=[x/2 for x in range(48)],value=float(times[sec]),format_func=lambda v:f'{int(v):02d}:{int((v%1)*60):02d}',key='person_'+sec+'_'+name)
-        override[(sec,name)]=entry
+st.subheader('3. Profiluri contractuale individuale')
+st.caption('Implicit, angajatii noi sunt Part-time, 4 ore/zi, repartizare inegala, pauza de masa 60 minute. Verifica datele fiecarui CIM inainte de salvare.')
+people_current=sorted({(k[2],k[3]) for k in schedule if k[:2]==(year,month)})
+if get_db_config() is None:
+    st.error('Persistenta nu este configurata. Adauga SUPABASE_URL si SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets. Poti testa profilurile doar in aceasta sesiune, dar ele NU vor fi salvate definitiv.')
+try:
+    stored=load_profiles()
+except Exception as exc:
+    st.error('Nu am putut citi baza de date Supabase: ' + str(exc))
+    st.stop()
+profiles={}
+for sec,name in people_current:
+    key=profile_key(sec,name)
+    profiles[key]={**DEFAULT_PROFILE, **{k:v for k,v in stored.get(key,{}).items() if k in DEFAULT_PROFILE}}
+import pandas as pd
+profile_table=pd.DataFrame([
+    {'Sectie':sec,'Angajat':name,'Contract':profiles[profile_key(sec,name)]['contract_type'],
+     'Ore/zi':float(profiles[profile_key(sec,name)]['hours_per_day']),
+     'Ore/sapt.':float(profiles[profile_key(sec,name)]['hours_per_week']),
+     'Repartizare':profiles[profile_key(sec,name)]['distribution'],
+     'Pauza minute':int(profiles[profile_key(sec,name)]['meal_minutes']),
+     'Start tura':profiles[profile_key(sec,name)]['shift_start'],
+     'Prezenta ore':float(profiles[profile_key(sec,name)]['shift_presence_hours'])}
+    for sec,name in people_current])
+edited=st.data_editor(profile_table,hide_index=True,use_container_width=True,num_rows='fixed',
+    disabled=['Sectie','Angajat'],key='employee_profiles_editor',column_config={
+    'Contract':st.column_config.SelectboxColumn(options=['Part-time','Full-time'],required=True),
+    'Repartizare':st.column_config.SelectboxColumn(options=['Inegala','Uniforma','In schimburi'],required=True),
+    'Ore/zi':st.column_config.NumberColumn(min_value=1,max_value=12,step=0.5,required=True),
+    'Ore/sapt.':st.column_config.NumberColumn(min_value=1,max_value=48,step=0.5,required=True),
+    'Pauza minute':st.column_config.NumberColumn(min_value=0,max_value=180,step=30,required=True),
+    'Prezenta ore':st.column_config.NumberColumn(min_value=1,max_value=16,step=0.5,required=True),
+    'Start tura':st.column_config.SelectboxColumn(options=[f'{h:02d}:{m:02d}' for h in range(24) for m in (0,30)],required=True)
+})
+validation=[]
+for _,rec in edited.iterrows():
+    key=profile_key(rec['Sectie'],rec['Angajat'])
+    p={'contract_type':str(rec['Contract']), 'hours_per_day':float(rec['Ore/zi']),
+       'hours_per_week':float(rec['Ore/sapt.']), 'distribution':str(rec['Repartizare']),
+       'meal_minutes':int(rec['Pauza minute']), 'shift_start':str(rec['Start tura']),
+       'shift_presence_hours':float(rec['Prezenta ore'])}
+    if p['shift_presence_hours'] <= p['meal_minutes']/60:
+        validation.append(f'{rec["Angajat"]}: durata prezentei trebuie sa depaseasca pauza.')
+    if p['contract_type']=='Part-time' and p['hours_per_week']>=40:
+        validation.append(f'{rec["Angajat"]}: norma part-time trebuie sa fie sub 40h/saptamana pentru un adult cu norma integrala de 40h.')
+    profiles[key]=p
+if validation:
+    for msg in validation:st.error(msg)
+    st.stop()
+if st.button('Salveaza permanent profilurile angajatilor',type='primary',disabled=get_db_config() is None):
+    tenant=get_db_config()[2]
+    payload=[{'tenant_id':tenant,'employee_key':profile_key(sec,name),'section':sec,'employee_name':name,**profiles[profile_key(sec,name)]} for sec,name in people_current]
+    try:
+        save_profiles(payload)
+        st.success(f'{len(payload)} profiluri salvate in baza de date cloud.')
+    except Exception as exc:st.error('Salvarea a esuat: '+str(exc))
+st.info('Modificarile din tabel sunt folosite imediat in simulare. Pentru persistenta trebuie apasat butonul de salvare. Un profil nou se initializeaza cu valorile implicite, pana la confirmarea contractului.')
+st.subheader('4. Reguli de verificare orientative')
+c1,c2=st.columns(2)
+min_rest=c1.number_input('Repaus intre ture (ore)',min_value=8,max_value=24,value=12)
+weekly_limit=c2.number_input('Prag ore saptamanale generale',min_value=8,max_value=80,value=48)
 if 'leave_items' not in st.session_state:st.session_state.leave_items=[]
-with st.expander('Concedii - adauga / sterge intervale',expanded=False):
+with st.expander('Concedii - doar in sesiune (nesalvate in baza de date)',expanded=False):
     person_names=sorted({(k[2],k[3]) for k in schedule if k[:2]==(year,month)})
     person_choice=st.selectbox('Angajat',person_names,format_func=lambda x:f'{x[0]} / {x[1]}')
     leave_type=st.selectbox('Tip', ['CO','CM','CFS','Alte absente'])
@@ -290,8 +407,14 @@ for yy,mm,person,first,last,typ in st.session_state.leave_items:
     while current<=last:
         leaves[(*person,current)]=typ
         current+=timedelta(days=1)
-rows=build_rows(schedule,year,month,shift_hours,times,override,meal_hours,leaves)
-issues=assess(rows,min_rest,weekly_limit)
+rows=[]
+for sec,name in people_current:
+    p=profiles[profile_key(sec,name)]
+    h,m=map(int,p['shift_start'].split(':'))
+    start_hour=h+m/60
+    subset={k:v for k,v in schedule.items() if k[:2]==(year,month) and k[2:]==(sec,name)}
+    rows.extend(build_rows(subset,year,month,p['shift_presence_hours'],{}, {(sec,name):start_hour}, p['meal_minutes']/60, leaves))
+issues=assess(rows,min_rest,weekly_limit) + check_individual(rows,profiles)
 c1,c2,c3=st.columns(3)
 c1.metric('Angajati detectati',len(set((r['section'],r['employee']) for r in rows)))
 c2.metric('Zile marcate ca lucrate',sum(r['is_work'] for r in rows))
@@ -303,8 +426,8 @@ if issues:
         st.dataframe([{'Sectie':i[0],'Angajat':i[1],'Perioada':i[2],'Regula':i[3],'Detalii':i[4]} for i in issues],use_container_width=True,hide_index=True)
 with st.expander('Diagnostic import'):
     for msg in diagnostics:st.text(msg)
-assumptions={'Durata tura':f'{shift_hours} ore','Prag repaus intre ture':f'{min_rest} ore','Prag ore/saptamana':f'{weekly_limit} ore',**{f'Ora start {s}':f'{int(h):02d}:{round((h % 1) * 60):02d}' for s,h in times.items()}}
-output=make_export(rows,issues,uploaded.name,year,month,assumptions,diagnostics)
+assumptions={'Repaus intre ture':f'{min_rest} ore','Prag general ore/saptamana':f'{weekly_limit} ore', 'Profiluri':'Configuratie individuala, consultati foaia PROFILURI'}
+output=make_export(rows,issues,uploaded.name,year,month,assumptions,diagnostics,profiles)
 st.download_button('⬇️ Descarca simularea Excel',data=output,file_name=f'SIMULARE_program_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
 st.caption('Aplicatia nu pastreaza un istoric al fisierelor. Nu incarcatI date personale in medii care nu au controalele de acces si GDPR adecvate.')
 
@@ -312,7 +435,7 @@ st.subheader('Export in formatul exact al sablonului CFP')
 template_upload=st.file_uploader('Incarca sablonul CFP original (.xlsx)',type=['xlsx'],key='cfp')
 if template_upload is not None:
     try:
-        cfp=make_cfp_export(rows,template_upload.getvalue(),year,month)
+        cfp=make_cfp_export(rows,template_upload.getvalue(),year,month,profiles)
         st.download_button('Descarca simularea in format CFP',data=cfp,file_name=f'SIMULARE_CFP_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
         st.caption('Sablonul este pastrat, iar intervalele generate sunt marcate explicit ca simulare. Validati formulele si norma contractuala.')
     except Exception as exc:st.error(f'Exportul CFP nu a reusit: {exc}')
