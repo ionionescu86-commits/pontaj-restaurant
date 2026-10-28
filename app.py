@@ -7,6 +7,7 @@ import unicodedata
 
 import streamlit as st
 from openpyxl import load_workbook, Workbook
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment
 
 st.set_page_config(page_title='Pontaj | Simulator retrospectiv', page_icon='📅', layout='wide')
@@ -74,10 +75,11 @@ def extract_schedule(data):
 
 def sample_shift(day, section, shift_hours, start_hour, night_start):
     # Non-factual scenario only; explicit deterministic planning assumptions.
-    start=datetime.combine(day,time(hour=start_hour%24))
+    start=datetime.combine(day,time.min)+timedelta(hours=start_hour)
     return start,start+timedelta(hours=shift_hours)
 
-def build_rows(schedule, year, month, hours, times, employee_overrides):
+def build_rows(schedule, year, month, hours, times, employee_overrides, meal_hours=1, leaves=None):
+    leaves=leaves or {}
     rows=[]
     for (y,m,section,employee),days in sorted(schedule.items(),key=lambda k:(k[0][2],k[0][3])):
         if (y,m)!=(year,month):continue
@@ -85,12 +87,13 @@ def build_rows(schedule, year, month, hours, times, employee_overrides):
         for day in range(1,calendar.monthrange(year,month)[1]+1):
             original=days.get(day,'')
             d=date(year,month,day)
-            work=is_work(original)
+            leave_type=leaves.get((section,employee,d))
+            work=is_work(original) and not leave_type
             if work:
                 start,end=sample_shift(d,section,hours,start_hour,22)
-                duration=(end-start).total_seconds()/3600
+                duration=max(0,(end-start).total_seconds()/3600-meal_hours)
             else:start=end=None;duration=0
-            rows.append({'section':section,'employee':employee,'date':d,'marker':original,'is_work':work,'start':start,'end':end,'hours':duration,'status':'Simulare pe baza marcajului x' if work else ('Marcaj neinterpretat' if original and textnorm(original) not in ('off','liber','l') else 'Fara prezenta simulata')})
+            rows.append({'section':section,'employee':employee,'date':d,'marker':original,'is_work':work,'start':start,'end':end,'hours':duration,'meal':meal_hours if work else 0,'leave':leave_type or '', 'status':('Concediu: '+leave_type) if leave_type else ('Simulare pe baza marcajului x' if work else ('Marcaj neinterpretat' if original and textnorm(original) not in ('off','liber','l') else 'Fara prezenta simulata'))})
     return rows
 
 def assess(rows, min_rest, weekly_limit):
@@ -124,9 +127,9 @@ def assess(rows, min_rest, weekly_limit):
 
 def make_export(rows,issues, source_name, year,month, assumptions,diagnostics):
     wb=Workbook(); sim=wb.active;sim.title='SIMULARE - NU PONTAJ'
-    sim.append(['SECTIE','ANGAJAT','DATA','ZI','MARCAJ SURSA','INTRARE SIMULATA','IESIRE SIMULATA','ORE SIMULATE','EXPLICATIE'])
+    sim.append(['SECTIE','ANGAJAT','DATA','ZI','MARCAJ SURSA','INTRARE SIMULATA','IESIRE SIMULATA','ORE SIMULATE','PAUZA MASA (h)','CONCEDIU','EXPLICATIE'])
     for r in rows:
-        sim.append([r['section'],r['employee'],r['date'],r['date'].strftime('%a'),r['marker'],r['start'],r['end'],r['hours'],r['status']])
+        sim.append([r['section'],r['employee'],r['date'],r['date'].strftime('%a'),r['marker'],r['start'],r['end'],r['hours'],r['meal'],r['leave'],r['status']])
     for row in sim.iter_rows(min_row=2):
         row[2].number_format='DD.MM.YYYY'; row[5].number_format='DD.MM.YYYY HH:MM'; row[6].number_format='DD.MM.YYYY HH:MM';row[7].number_format='0.00'
     a=wb.create_sheet('ABATERI SIMULARE');a.append(['SECTIE','ANGAJAT','PERIOADA','REGULA','OBSERVATIE'])
@@ -153,6 +156,72 @@ def make_export(rows,issues, source_name, year,month, assumptions,diagnostics):
             ws.column_dimensions[letter].width=width
     stream=BytesIO();wb.save(stream);return stream.getvalue()
 
+def make_cfp_export(rows, template_bytes, year, month):
+    """Copy the actual CFP template unchanged in layout; fill only simulated roster and time cells.
+    If roster exceeds available blocks, use additional copies of the same template as new sheets.
+    """
+    wb=load_workbook(BytesIO(template_bytes))
+    ws=wb.worksheets[0]
+    template_starts=[r for r in range(16,ws.max_row+1) if isinstance(ws.cell(r,1).value,int) and ws.cell(r,2).value]
+    if not template_starts: raise ValueError('Sablonul CFP nu contine blocurile de 7 randuri asteptate.')
+    names=sorted(set((r['section'],r['employee']) for r in rows))
+    by_person=defaultdict(dict)
+    for r in rows:by_person[(r['section'],r['employee'])][r['date'].day]=r
+    sheets=[]
+    for index in range(0,len(names),len(template_starts)):
+        tab=ws if index==0 else wb.copy_worksheet(ws)
+        tab.title=f'SIMULARE CFP {index//len(template_starts)+1}'
+        tab['A6']=datetime(year,month,1)
+        sheets.append(tab)
+        for slot,base in enumerate(template_starts):
+            pos=index+slot
+            if pos>=len(names):
+                tab.cell(base,1).value=None
+                tab.cell(base,2).value=None
+                tab.cell(base,3).value=None
+                tab.cell(base,4).value=None
+                for day in range(1,32):
+                    c=6+2*(day-1)
+                    for offset,cc in [(1,c),(1,c+1),(2,c),(2,c+1),(3,c),(3,c+1),(5,c),(5,c+1),(6,c),(6,c+1)]:
+                        tab.cell(base+offset,cc).value=None
+                continue
+            sec,name=names[pos]
+            tab.cell(base,1).value=pos+1
+            tab.cell(base,2).value=name
+            tab.cell(base,3).value=None  # do not inherit another employee's hire date
+            tab.cell(base,4).value=sec
+            tab.cell(base,5).value=8  # assumption only, not verified contracted norm
+            for day in range(1,32):
+                c=6+2*(day-1)
+                r=by_person[(sec,name)].get(day)
+                # Clear values from prior example; retain template's daily formulas and formatting.
+                for offset,cc in [(1,c),(1,c+1),(2,c),(2,c+1),(3,c),(3,c+1),(5,c),(5,c+1),(6,c),(6,c+1)]:
+                    tab.cell(base+offset,cc).value=None
+                if r and r['is_work']:
+                    start=r['start'];end=r['end']
+                    tab.cell(base+2,c).value=timedelta(hours=start.hour,minutes=start.minute)
+                    tab.cell(base+2,c+1).value=end-start.replace(hour=0,minute=0,second=0,microsecond=0)
+                    tab.cell(base+2,c).number_format='[h]:mm'
+                    tab.cell(base+2,c+1).number_format='[h]:mm'
+                    tab.cell(base+5,c).value=timedelta(hours=r['meal'])
+                    tab.cell(base+5,c+1).value='masa'
+                elif r and r['leave']:
+                    tab.cell(base+1,c).value=r['leave']
+    # A visible disclosure on the existing sheet, outside the main time grid.
+    for tab in sheets:
+        tab['A136']='SIMULARE RETROSPECTIVA - NU ESTE EVIDENTA ORELOR EFECTIV LUCRATE'
+        tab['A136'].font=Font(bold=True,color='C00000')
+    audit=wb.create_sheet('SIMULARE - IPOTEZE')
+    for line in [
+        ['TIP','SIMULARE - NU PONTAJ REAL'],
+        ['PERIOADA',f'{month:02d}/{year}'],
+        ['PAUZA MASA','Scazuta din durata de prezenta; configurata in aplicatie'],
+        ['DATE CONTRACTUALE','Norma din sablon este o ipoteza (8 ore); validati individual'],
+        ['CONCEDII','Marcaje adaugate doar in scenariu, nu documente justificative'],
+        ['ATENTIE','Datele din acest fisier nu pot inlocui evidenta orelor efectiv lucrate']
+    ]:audit.append(line)
+    stream=BytesIO();wb.save(stream);return stream.getvalue()
+
 uploaded=st.file_uploader('1. Incarca fisierul de program (Kitchen Staff)',type=['xlsx'])
 if uploaded is None:
     st.info('Incarca fisierul Kitchen Staff Sched New.xlsx. Aplicatia recunoaste sectiunile Kitchen, Sala si lunile din acelasi workbook.')
@@ -168,27 +237,50 @@ year,month=labels[selected]
 st.subheader('3. Ipoteze pentru scenariul de ture')
 st.caption('Acestea sunt ore presupuse, nu ore constatate. Poti modifica orele pe sectie si pe angajat.')
 cols=st.columns(3)
-shift_hours=cols[0].number_input('Durata turei simulate (ore)',min_value=1,max_value=16,value=8,step=1)
+shift_hours=cols[0].number_input('Durata prezentei simulate (ore, include pauza)',min_value=1.5,max_value=16.0,value=9.0,step=0.5)
 min_rest=cols[1].number_input('Prag orientativ repaus intre ture (ore)',min_value=1,max_value=24,value=12)
 weekly_limit=cols[2].number_input('Prag orientativ ore/saptamana',min_value=8,max_value=80,value=48)
+meal_hours=st.selectbox('Pauza de masa scazuta din prezenta', [1.0,0.5,0.0], index=0, format_func=lambda v:f'{v:g} ore')
 sections=sorted({k[2] for k in schedule if k[:2]==(year,month)})
 times={}
 for section in sections:
-    times[section]=st.slider(f'Ora inceperii turei simulate – {section}',0,23,10,key='start_'+section)
+    times[section]=st.select_slider(f'Ora inceperii turei simulate – {section}',options=[x/2 for x in range(48)],value=10.0,format_func=lambda v:f'{int(v):02d}:{int((v%1)*60):02d}',key='start_'+section)
 with st.expander('Ore de inceput personalizate pe angajat (optional)'):
     override={}
     persons=sorted({(k[2],k[3]) for k in schedule if k[:2]==(year,month)})
     for sec,name in persons:
-        entry=st.number_input(f'{sec} / {name}',min_value=0,max_value=23,value=int(times[sec]),key='person_'+sec+'_'+name)
+        entry=st.select_slider(f'{sec} / {name}',options=[x/2 for x in range(48)],value=float(times[sec]),format_func=lambda v:f'{int(v):02d}:{int((v%1)*60):02d}',key='person_'+sec+'_'+name)
         override[(sec,name)]=entry
-rows=build_rows(schedule,year,month,shift_hours,times,override)
+if 'leave_items' not in st.session_state:st.session_state.leave_items=[]
+with st.expander('Concedii - adauga / sterge intervale',expanded=False):
+    person_names=sorted({(k[2],k[3]) for k in schedule if k[:2]==(year,month)})
+    person_choice=st.selectbox('Angajat',person_names,format_func=lambda x:f'{x[0]} / {x[1]}')
+    leave_type=st.selectbox('Tip', ['CO','CM','CFS','Alte absente'])
+    lcol1,lcol2=st.columns(2)
+    first=lcol1.date_input('De la',value=date(year,month,1),min_value=date(year,month,1),max_value=date(year,month,calendar.monthrange(year,month)[1]))
+    last=lcol2.date_input('Pana la',value=date(year,month,1),min_value=date(year,month,1),max_value=date(year,month,calendar.monthrange(year,month)[1]))
+    if st.button('Adauga concediul'):
+        if last<first:st.error('Data finala este inaintea datei initiale.')
+        else:st.session_state.leave_items.append((year,month,person_choice,first,last,leave_type))
+    for idx, item in enumerate(list(st.session_state.leave_items)):
+        if item[:2]!=(year,month):continue
+        st.write(f'{idx+1}. {item[2][1]} | {item[3]} – {item[4]} | {item[5]}')
+    if st.button('Sterge toate concediile din sesiune'):st.session_state.leave_items=[];st.rerun()
+leaves={}
+for yy,mm,person,first,last,typ in st.session_state.leave_items:
+    if (yy,mm)!=(year,month):continue
+    current=first
+    while current<=last:
+        leaves[(*person,current)]=typ
+        current+=timedelta(days=1)
+rows=build_rows(schedule,year,month,shift_hours,times,override,meal_hours,leaves)
 issues=assess(rows,min_rest,weekly_limit)
 c1,c2,c3=st.columns(3)
 c1.metric('Angajati detectati',len(set((r['section'],r['employee']) for r in rows)))
 c2.metric('Zile marcate ca lucrate',sum(r['is_work'] for r in rows))
 c3.metric('Semnalari orientative',len(issues))
 st.subheader('Previzualizare simulare')
-st.dataframe([{'Sectie':r['section'],'Angajat':r['employee'],'Data':str(r['date']),'Original':r['marker'],'Intrare simulata':r['start'].strftime('%d.%m %H:%M') if r['start'] else '', 'Iesire simulata':r['end'].strftime('%d.%m %H:%M') if r['end'] else '', 'Ore':r['hours']} for r in rows if r['is_work']],use_container_width=True,hide_index=True)
+st.dataframe([{'Sectie':r['section'],'Angajat':r['employee'],'Data':str(r['date']),'Original':r['marker'],'Intrare simulata':r['start'].strftime('%d.%m %H:%M') if r['start'] else '', 'Iesire simulata':r['end'].strftime('%d.%m %H:%M') if r['end'] else '', 'Ore efective simulate':r['hours'],'Pauza masa':r['meal'],'Concediu':r['leave']} for r in rows if r['is_work']],use_container_width=True,hide_index=True)
 if issues:
     with st.expander('Semnalari / abateri de verificat'):
         st.dataframe([{'Sectie':i[0],'Angajat':i[1],'Perioada':i[2],'Regula':i[3],'Detalii':i[4]} for i in issues],use_container_width=True,hide_index=True)
@@ -198,3 +290,12 @@ assumptions={'Durata tura':f'{shift_hours} ore','Prag repaus intre ture':f'{min_
 output=make_export(rows,issues,uploaded.name,year,month,assumptions,diagnostics)
 st.download_button('⬇️ Descarca simularea Excel',data=output,file_name=f'SIMULARE_program_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
 st.caption('Aplicatia nu pastreaza un istoric al fisierelor. Nu incarcatI date personale in medii care nu au controalele de acces si GDPR adecvate.')
+
+st.subheader('Export in formatul exact al sablonului CFP')
+template_upload=st.file_uploader('Incarca sablonul CFP original (.xlsx)',type=['xlsx'],key='cfp')
+if template_upload is not None:
+    try:
+        cfp=make_cfp_export(rows,template_upload.getvalue(),year,month)
+        st.download_button('Descarca simularea in format CFP',data=cfp,file_name=f'SIMULARE_CFP_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
+        st.caption('Sablonul este pastrat, iar intervalele generate sunt marcate explicit ca simulare. Validati formulele si norma contractuala.')
+    except Exception as exc:st.error(f'Exportul CFP nu a reusit: {exc}')
