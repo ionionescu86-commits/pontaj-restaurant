@@ -7,6 +7,7 @@ import unicodedata
 
 import streamlit as st
 from openpyxl import load_workbook, Workbook
+from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -161,6 +162,22 @@ def make_cfp_export(rows, template_bytes, year, month):
     If roster exceeds available blocks, use additional copies of the same template as new sheets.
     """
     wb=load_workbook(BytesIO(template_bytes))
+    def clear_editable(sheet, row, col):
+        cell = sheet.cell(row, col)
+        # MergedCell is a read-only placeholder for the non-anchor portion of a merge.
+        # Keep formulas in the official template intact.
+        if isinstance(cell, MergedCell) or cell.data_type == 'f':
+            return
+        cell.value = None
+
+    def write_editable(sheet, row, col, value, required=False):
+        cell = sheet.cell(row, col)
+        if isinstance(cell, MergedCell):
+            if required:
+                raise ValueError(f'Campul obligatoriu {sheet.title}!{cell.coordinate} este unit cu alta celula in sablon.')
+            return False
+        cell.value = value
+        return True
     ws=wb.worksheets[0]
     template_starts=[r for r in range(16,ws.max_row+1) if isinstance(ws.cell(r,1).value,int) and ws.cell(r,2).value]
     if not template_starts: raise ValueError('Sablonul CFP nu contine blocurile de 7 randuri asteptate.')
@@ -176,37 +193,37 @@ def make_cfp_export(rows, template_bytes, year, month):
         for slot,base in enumerate(template_starts):
             pos=index+slot
             if pos>=len(names):
-                tab.cell(base,1).value=None
-                tab.cell(base,2).value=None
-                tab.cell(base,3).value=None
-                tab.cell(base,4).value=None
+                clear_editable(tab,base,1)
+                clear_editable(tab,base,2)
+                clear_editable(tab,base,3)
+                clear_editable(tab,base,4)
                 for day in range(1,32):
                     c=6+2*(day-1)
                     for offset,cc in [(1,c),(1,c+1),(2,c),(2,c+1),(3,c),(3,c+1),(5,c),(5,c+1),(6,c),(6,c+1)]:
-                        tab.cell(base+offset,cc).value=None
+                        clear_editable(tab,base+offset,cc)
                 continue
             sec,name=names[pos]
-            tab.cell(base,1).value=pos+1
-            tab.cell(base,2).value=name
-            tab.cell(base,3).value=None  # do not inherit another employee's hire date
-            tab.cell(base,4).value=sec
-            tab.cell(base,5).value=8  # assumption only, not verified contracted norm
+            write_editable(tab,base,1,pos+1,required=True)
+            write_editable(tab,base,2,name,required=True)
+            clear_editable(tab,base,3)  # do not inherit another employee's hire date
+            write_editable(tab,base,4,sec)
+            write_editable(tab,base,5,8)  # assumption only, not verified contracted norm
             for day in range(1,32):
                 c=6+2*(day-1)
                 r=by_person[(sec,name)].get(day)
                 # Clear values from prior example; retain template's daily formulas and formatting.
                 for offset,cc in [(1,c),(1,c+1),(2,c),(2,c+1),(3,c),(3,c+1),(5,c),(5,c+1),(6,c),(6,c+1)]:
-                    tab.cell(base+offset,cc).value=None
+                    clear_editable(tab,base+offset,cc)
                 if r and r['is_work']:
                     start=r['start'];end=r['end']
-                    tab.cell(base+2,c).value=timedelta(hours=start.hour,minutes=start.minute)
-                    tab.cell(base+2,c+1).value=end-start.replace(hour=0,minute=0,second=0,microsecond=0)
+                    write_editable(tab,base+2,c,timedelta(hours=start.hour,minutes=start.minute),required=True)
+                    write_editable(tab,base+2,c+1,end-start.replace(hour=0,minute=0,second=0,microsecond=0),required=True)
                     tab.cell(base+2,c).number_format='[h]:mm'
                     tab.cell(base+2,c+1).number_format='[h]:mm'
-                    tab.cell(base+5,c).value=timedelta(hours=r['meal'])
-                    tab.cell(base+5,c+1).value='masa'
+                    write_editable(tab,base+5,c,timedelta(hours=r['meal']))
+                    write_editable(tab,base+5,c+1,'masa')
                 elif r and r['leave']:
-                    tab.cell(base+1,c).value=r['leave']
+                    write_editable(tab,base+1,c,r['leave'],required=True)
     # A visible disclosure on the existing sheet, outside the main time grid.
     for tab in sheets:
         tab['A136']='SIMULARE RETROSPECTIVA - NU ESTE EVIDENTA ORELOR EFECTIV LUCRATE'
@@ -286,15 +303,7 @@ if issues:
         st.dataframe([{'Sectie':i[0],'Angajat':i[1],'Perioada':i[2],'Regula':i[3],'Detalii':i[4]} for i in issues],use_container_width=True,hide_index=True)
 with st.expander('Diagnostic import'):
     for msg in diagnostics:st.text(msg)
-assumptions = {
-    'Durata tura': f'{shift_hours} ore',
-    'Prag repaus intre ture': f'{min_rest} ore',
-    'Prag ore/saptamana': f'{weekly_limit} ore',
-    **{
-        f'Ora start {s}': f'{int(h):02d}:{int((h % 1) * 60):02d}'
-        for s, h in times.items()
-    }
-}
+assumptions={'Durata tura':f'{shift_hours} ore','Prag repaus intre ture':f'{min_rest} ore','Prag ore/saptamana':f'{weekly_limit} ore',**{f'Ora start {s}':f'{int(h):02d}:{round((h % 1) * 60):02d}' for s,h in times.items()}}
 output=make_export(rows,issues,uploaded.name,year,month,assumptions,diagnostics)
 st.download_button('⬇️ Descarca simularea Excel',data=output,file_name=f'SIMULARE_program_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
 st.caption('Aplicatia nu pastreaza un istoric al fisierelor. Nu incarcatI date personale in medii care nu au controalele de acces si GDPR adecvate.')
