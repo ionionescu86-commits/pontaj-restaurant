@@ -169,6 +169,58 @@ def make_export(rows,issues, source_name, year,month, assumptions,diagnostics,pr
         pass
     stream=BytesIO();wb.save(stream);return stream.getvalue()
 
+def orthodox_easter(year):
+    # Gregorian calendar date of Orthodox Easter, valid for the contemporary period.
+    a,b,c=year%4,year%7,year%19
+    d=(19*c+15)%30
+    e=(2*a+4*b-d+34)%7
+    month=(d+e+114)//31
+    day=(d+e+114)%31+1
+    return date(year,month,day)+timedelta(days=13)
+
+def ro_holidays(year):
+    easter=orthodox_easter(year)
+    fixed={(1,1),(1,2),(1,6),(1,7),(1,24),(5,1),(6,1),(8,15),(11,30),(12,1),(12,25),(12,26)}
+    dates={date(year,m,d) for m,d in fixed}
+    dates.update({easter-timedelta(days=2),easter,easter+timedelta(days=1),easter+timedelta(days=49),easter+timedelta(days=50)})
+    return dates
+
+def breakdown_shift(start,end,meal_hours,holidays):
+    # Hours by calendar day and by 22:00-06:00, split across midnight.
+    # Meal-break placement is unknown: subcategory hours are gross presence,
+    # and must not be treated as exact payable night/weekend/holiday hours.
+    night=weekend=holiday=0.0
+    cursor=start
+    while cursor<end:
+        boundary=min(end,datetime.combine(cursor.date()+timedelta(days=1),time.min))
+        span=(boundary-cursor).total_seconds()/3600
+        if cursor.weekday()>=5:weekend+=span
+        if cursor.date() in holidays:holiday+=span
+        for ns,ne in ((datetime.combine(cursor.date(),time.min),datetime.combine(cursor.date(),time(6))),
+                      (datetime.combine(cursor.date(),time(22)),datetime.combine(cursor.date()+timedelta(days=1),time.min))):
+            night+=max(0,(min(boundary,ne)-max(cursor,ns)).total_seconds()/3600)
+        cursor=boundary
+    return night,weekend,holiday
+
+# CFP codes are read from the reference template's column headers.
+LEAVE_SUMMARY_COLUMNS={'CO':'BZ','EVD':'CA','CFS':'CB','CST':'CC','CM':'CD','CIC':'CE','DL':'CF','LP':'CG','N':'CH','S':'CI','OT':'CJ','X':'CK'}
+
+def cfp_summary_values(person_days, year):
+    holidays=ro_holidays(year)
+    values={'BP':0., 'BW':0., 'BX':0., 'BY':0.}
+    values.update({c:0 for c in LEAVE_SUMMARY_COLUMNS.values()})
+    for r in person_days.values():
+        if r.get('is_work') and r.get('start') and r.get('end'):
+            values['BP']+=float(r['hours'])
+            n,w,h=breakdown_shift(r['start'],r['end'],r.get('meal',0),holidays)
+            values['BW']+=n;values['BX']+=w;values['BY']+=h
+        leave=str(r.get('leave') or '').strip().upper()
+        if leave in LEAVE_SUMMARY_COLUMNS:
+            values[LEAVE_SUMMARY_COLUMNS[leave]]+=1
+    # Regie, overtime, compensating hours, permissions etc. require explicit
+    # payroll classification; do not manufacture those figures.
+    return values
+
 def make_cfp_export(rows, template_bytes, year, month, profiles):
     """Copy the actual CFP template unchanged in layout; fill only simulated roster and time cells.
     If roster exceeds available blocks, use additional copies of the same template as new sheets.
@@ -226,10 +278,19 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
             clear_editable(tab,base,3)  # do not inherit another employee's hire date
             write_editable(tab,base,4,sec)
             write_editable(tab,base,5,profiles[profile_key(sec,name)]['hours_per_day'])  # norma de referinta din profil, confirmare CIM necesara
-            # Remove inherited literal leave counters from the original CFP example.
-            # Leave formulas intact so Excel may recalculate on opening.
-            for summary_col in range(66, tab.max_column+1):
+            # Rebuild the CFP monthly summary from simulation rows, not historical sample formulas.
+            # BP:CK maps to the 22 named columns in the original CFP template.
+            for summary_col in range(68, 90):  # BP .. CK
                 clear_editable(tab,base,summary_col)
+            totals=cfp_summary_values(by_person[(sec,name)],year)
+            for col_label,value in totals.items():
+                dest=tab[f'{col_label}{base}']
+                if isinstance(dest,MergedCell):
+                    raise ValueError(f'Coloana de sumar {dest.coordinate} este unita neasteptat')
+                dest.value=round(value,2) if col_label in ('BP','BW','BX','BY') else value
+                dest.number_format='0.00' if col_label in ('BP','BW','BX','BY') else '0'
+            # Unknown payroll classifications remain intentionally blank rather than fabricated.
+            # BQ/BR/BS/BT/BU/BV must be supplied by payroll records or explicit inputs.
             for day in range(1,32):
                 c=6+2*(day-1)
                 r=by_person[(sec,name)].get(day)
@@ -270,6 +331,9 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
         ['PAUZA MASA','Scazuta din durata de prezenta; configurata in aplicatie'],
         ['DATE CONTRACTUALE','Normele individuale sunt preluate din profilurile configurate si necesita confirmare CIM'],
         ['CONCEDII','Doar perioadele introduse explicit in aplicatie; zilele nelucrate nu sunt concedii'],
+        ['SUMAR CFP','BP ore lucrate nete; BW/BX/BY ore de prezenta brute pe intervale, FARA localizarea pauzei de masa; nu sunt ore salariale definitive'],
+        ['CAMPURI NEDETERMINATE','BQ-BV (regie, suplimentare, completare norma, invoire, ore libere platite, nemotivate) raman goale fara date de payroll'],
+        ['SARABATORI','Sarbatori nationale din Romania incluse; zilele cu tratament special trebuie verificate inainte de folosire operationala'],
         ['ATENTIE','Datele din acest fisier nu pot inlocui evidenta orelor efectiv lucrate']
     ]:audit.append(line)
     # Ask Excel to recalculate all formulas when the generated workbook is opened.
