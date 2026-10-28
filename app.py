@@ -184,6 +184,8 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
         cell.value = value
         return True
     ws=wb.worksheets[0]
+    # The CFP template itself contains historical leave summary values.
+    # Clear literal values in summary area, while preserving formula cells.
     template_starts=[r for r in range(16,ws.max_row+1) if isinstance(ws.cell(r,1).value,int) and ws.cell(r,2).value]
     if not template_starts: raise ValueError('Sablonul CFP nu contine blocurile de 7 randuri asteptate.')
     names=sorted(set((r['section'],r['employee']) for r in rows))
@@ -202,6 +204,8 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
                 clear_editable(tab,base,2)
                 clear_editable(tab,base,3)
                 clear_editable(tab,base,4)
+                for summary_col in range(66,tab.max_column+1):
+                    clear_editable(tab,base,summary_col)
                 for day in range(1,32):
                     c=6+2*(day-1)
                     for offset,cc in [(1,c),(1,c+1),(2,c),(2,c+1),(3,c),(3,c+1),(5,c),(5,c+1),(6,c),(6,c+1)]:
@@ -213,6 +217,10 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
             clear_editable(tab,base,3)  # do not inherit another employee's hire date
             write_editable(tab,base,4,sec)
             write_editable(tab,base,5,profiles[profile_key(sec,name)]['hours_per_day'])  # norma de referinta din profil, confirmare CIM necesara
+            # Remove inherited literal leave counters from the original CFP example.
+            # Leave formulas intact so Excel may recalculate on opening.
+            for summary_col in range(66, tab.max_column+1):
+                clear_editable(tab,base,summary_col)
             for day in range(1,32):
                 c=6+2*(day-1)
                 r=by_person[(sec,name)].get(day)
@@ -335,9 +343,16 @@ except Exception as exc:
     st.error('Nu am putut citi baza de date Supabase: ' + str(exc))
     st.stop()
 profiles={}
+if 'force_fulltime' not in st.session_state: st.session_state.force_fulltime=False
 for sec,name in people_current:
     key=profile_key(sec,name)
-    profiles[key]={**DEFAULT_PROFILE, **{k:v for k,v in stored.get(key,{}).items() if k in DEFAULT_PROFILE}}
+    profiles[key]=({**DEFAULT_PROFILE} if st.session_state.force_fulltime else {**DEFAULT_PROFILE, **{k:v for k,v in stored.get(key,{}).items() if k in DEFAULT_PROFILE}})
+if st.button('Reseteaza TOATE profilurile din luna la Full-time 8h / 40h (nesalvat pana apesi Salveaza)'):
+    st.session_state.force_fulltime=True
+    st.session_state.pop('employee_profiles_editor',None)
+    st.rerun()
+if st.session_state.force_fulltime:
+    st.warning('Mod resetare activ: toate profilurile sunt temporar Full-time 8h / 40h. Apasa Salveaza permanent pentru a actualiza Supabase. Verifica individual angajatii cu contract part-time real.')
 import pandas as pd
 profile_table=pd.DataFrame([
     {'Sectie':sec,'Angajat':name,'Contract':profiles[profile_key(sec,name)]['contract_type'],
@@ -379,8 +394,9 @@ if st.button('Salveaza permanent profilurile angajatilor',type='primary',disable
     try:
         save_profiles(payload)
         st.success(f'{len(payload)} profiluri salvate in baza de date cloud.')
+        st.session_state.force_fulltime=False
     except Exception as exc:st.error('Salvarea a esuat: '+str(exc))
-st.info('Profilurile deja salvate in Supabase raman neschimbate (inclusiv cele part-time din v3). Valorile Full-time 8h se aplica numai angajatilor fara profil salvat. Pentru a schimba un profil existent, actualizeaza randul si apasa Salveaza permanent profilurile angajatilor.')
+st.info('Profilurile existente sunt incarcate din Supabase. Pentru a corecta toate profilurile initial gresite la 4h, foloseste butonul de resetare si apoi Salveaza permanent. Nu reseta angajatii cu part-time real fara verificare.')
 st.subheader('4. Reguli de verificare orientative')
 c1,c2=st.columns(2)
 min_rest=c1.number_input('Repaus intre ture (ore)',min_value=8,max_value=24,value=12)
@@ -420,6 +436,14 @@ c1,c2,c3=st.columns(3)
 c1.metric('Angajati detectati',len(set((r['section'],r['employee']) for r in rows)))
 c2.metric('Zile marcate ca lucrate',sum(r['is_work'] for r in rows))
 c3.metric('Semnalari orientative',len(issues))
+st.metric('TOTAL ORE SIMULATE IN LUNA',f'{sum(r["hours"] for r in rows):.1f} h')
+summary=[]
+for sec,name in people_current:
+    person_rows=[r for r in rows if (r['section'],r['employee'])==(sec,name)]
+    summary.append({'Sectie':sec,'Angajat':name,'Norma contractuala ore/zi':profiles[profile_key(sec,name)]['hours_per_day'], 'Zile lucrate simulate':sum(r['is_work'] for r in person_rows),'Ore simulate pe zi lucrata':round(profiles[profile_key(sec,name)]['shift_presence_hours']-profiles[profile_key(sec,name)]['meal_minutes']/60,2), 'TOTAL ORE SIMULATE':round(sum(r['hours'] for r in person_rows),2),'Zile concediu MANUAL':sum(bool(r['leave']) for r in person_rows)})
+st.subheader('Sumar ore pe angajat')
+st.dataframe(summary,use_container_width=True,hide_index=True)
+st.caption('Zilele de concediu din aceasta aplicatie sunt EXCLUSIV cele adaugate manual; daca apare alt numar in sablonul CFP, verificati formulele sale mostenite.')
 st.subheader('Previzualizare simulare (inclusiv zile libere si concedii manuale)')
 st.caption('CONCEDIU = numai daca a fost introdus manual. ZILE NELUCRATE = marcaj gol, OFF sau liber fara cerere de concediu.')
 st.dataframe([{'Sectie':r['section'],'Angajat':r['employee'],'Data':str(r['date']),'Original':r['marker'],'Status':('Concediu introdus manual' if r['leave'] else ('Zi lucrata' if r['is_work'] else 'Zi nelucrata')), 'Intrare simulata':r['start'].strftime('%d.%m %H:%M') if r['start'] else '', 'Iesire simulata':r['end'].strftime('%d.%m %H:%M') if r['end'] else '', 'Ore efective simulate':r['hours'],'Pauza masa':r['meal'],'Concediu':r['leave']} for r in rows],use_container_width=True,hide_index=True)
