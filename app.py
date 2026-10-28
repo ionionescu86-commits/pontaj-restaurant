@@ -286,7 +286,15 @@ if issues:
         st.dataframe([{'Sectie':i[0],'Angajat':i[1],'Perioada':i[2],'Regula':i[3],'Detalii':i[4]} for i in issues],use_container_width=True,hide_index=True)
 with st.expander('Diagnostic import'):
     for msg in diagnostics:st.text(msg)
-assumptions={'Durata tura':f'{shift_hours} ore','Prag repaus intre ture':f'{min_rest} ore','Prag ore/saptamana':f'{weekly_limit} ore',**{f'Ora start {s}':f'{h:02d}:00' for s,h in times.items()}}
+assumptions = {
+    'Durata tura': f'{shift_hours} ore',
+    'Prag repaus intre ture': f'{min_rest} ore',
+    'Prag ore/saptamana': f'{weekly_limit} ore',
+    **{
+        f'Ora start {s}': f'{int(h):02d}:{int((h % 1) * 60):02d}'
+        for s, h in times.items()
+    }
+}
 output=make_export(rows,issues,uploaded.name,year,month,assumptions,diagnostics)
 st.download_button('⬇️ Descarca simularea Excel',data=output,file_name=f'SIMULARE_program_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
 st.caption('Aplicatia nu pastreaza un istoric al fisierelor. Nu incarcatI date personale in medii care nu au controalele de acces si GDPR adecvate.')
