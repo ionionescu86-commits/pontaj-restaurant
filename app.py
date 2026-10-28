@@ -160,6 +160,13 @@ def make_export(rows,issues, source_name, year,month, assumptions,diagnostics,pr
     for (sec,name) in sorted({(r['section'],r['employee']) for r in rows}):
         p=profiles[profile_key(sec,name)]
         prof.append([sec,name,p['contract_type'],p['hours_per_day'],p['hours_per_week'],p['distribution'],p['meal_minutes'],p['shift_start'],p['shift_presence_hours']])
+    # Ask Excel to recalculate all formulas when the generated workbook is opened.
+    try:
+        wb.calculation.fullCalcOnLoad=True
+        wb.calculation.forceFullCalc=True
+        wb.calculation.calcMode='auto'
+    except AttributeError:
+        pass
     stream=BytesIO();wb.save(stream);return stream.getvalue()
 
 def make_cfp_export(rows, template_bytes, year, month, profiles):
@@ -171,7 +178,7 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
         cell = sheet.cell(row, col)
         # MergedCell is a read-only placeholder for the non-anchor portion of a merge.
         # Keep formulas in the official template intact.
-        if isinstance(cell, MergedCell) or cell.data_type == 'f':
+        if isinstance(cell, MergedCell):
             return
         cell.value = None
 
@@ -208,6 +215,8 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
                     clear_editable(tab,base,summary_col)
                 for day in range(1,32):
                     c=6+2*(day-1)
+                    clear_editable(tab,base,c)
+                    clear_editable(tab,base,c+1)
                     for offset,cc in [(1,c),(1,c+1),(2,c),(2,c+1),(3,c),(3,c+1),(5,c),(5,c+1),(6,c),(6,c+1)]:
                         clear_editable(tab,base+offset,cc)
                 continue
@@ -224,7 +233,11 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
             for day in range(1,32):
                 c=6+2*(day-1)
                 r=by_person[(sec,name)].get(day)
-                # Clear values from prior example; retain template's daily formulas and formatting.
+                # Rebuild daily calculation cells; formulas in the sample template are incomplete.
+                # Only working days receive an hours formula, other days remain blank.
+                clear_editable(tab,base,c)
+                clear_editable(tab,base,c+1)
+                # Clear sample's daily input values and keep its formatting.
                 for offset,cc in [(1,c),(1,c+1),(2,c),(2,c+1),(3,c),(3,c+1),(5,c),(5,c+1),(6,c),(6,c+1)]:
                     clear_editable(tab,base+offset,cc)
                 if r and r['is_work']:
@@ -235,6 +248,15 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
                     tab.cell(base+2,c+1).number_format='[h]:mm'
                     write_editable(tab,base+5,c,timedelta(hours=r['meal']))
                     write_editable(tab,base+5,c+1,'masa')
+                    # Calculate hours from entry/exit (including overnight shifts) minus meal break.
+                    # Use formula instead of cached/static totals in the historical CFP template.
+                    start_ref=f'{get_column_letter(c)}{base+2}'
+                    end_ref=f'{get_column_letter(c+1)}{base+2}'
+                    meal_ref=f'{get_column_letter(c)}{base+5}'
+                    hours_formula=(f'=IF(AND(ISNUMBER({start_ref}),ISNUMBER({end_ref})),'
+                                   f'MAX(0,MOD({end_ref}-{start_ref},1)-IF(ISNUMBER({meal_ref}),{meal_ref},0)),"")')
+                    write_editable(tab,base,c,hours_formula,required=True)
+                    tab.cell(base,c).number_format='[h]:mm'
                 elif r and r['leave']:
                     write_editable(tab,base+1,c,r['leave'],required=True)
     # A visible disclosure on the existing sheet, outside the main time grid.
@@ -250,6 +272,13 @@ def make_cfp_export(rows, template_bytes, year, month, profiles):
         ['CONCEDII','Doar perioadele introduse explicit in aplicatie; zilele nelucrate nu sunt concedii'],
         ['ATENTIE','Datele din acest fisier nu pot inlocui evidenta orelor efectiv lucrate']
     ]:audit.append(line)
+    # Ask Excel to recalculate all formulas when the generated workbook is opened.
+    try:
+        wb.calculation.fullCalcOnLoad=True
+        wb.calculation.forceFullCalc=True
+        wb.calculation.calcMode='auto'
+    except AttributeError:
+        pass
     stream=BytesIO();wb.save(stream);return stream.getvalue()
 
 
